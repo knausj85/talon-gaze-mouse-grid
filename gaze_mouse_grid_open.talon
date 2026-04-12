@@ -4,10 +4,10 @@
 mode: user.gaze_mouse_grid
 -
 # "kuh" toggles grid closed (same sound as opening)
-parrot(kuh): user.gaze_grid_toggle()
+#parrot(kuh): user.gaze_grid_toggle()
 
 # "tih" narrows the grid: zooms into the cell under your cursor
-parrot(tih): user.gaze_grid_narrow_at_cursor()
+#parrot(tih): user.gaze_grid_narrow_at_cursor()
 
 # "clop" clicks at the target location and closes the grid
-parrot(clop): user.gaze_grid_click()
+#parrot(clop): user.gaze_grid_click()
