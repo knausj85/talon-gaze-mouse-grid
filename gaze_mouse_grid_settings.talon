@@ -8,7 +8,7 @@ settings():
 
     # How much the initial gaze-based narrow zooms in.
     # 2 = start with half the screen; 3 = start with a third, etc.
-    user.gaze_grid_initial_narrow_factor = 2
+    user.gaze_grid_initial_narrow_factor = 5
 
     # Cells of padding around the selected cell when narrowing.
     # 0 = no padding, zoom exactly to the selected cell.
@@ -37,3 +37,23 @@ settings():
     # Save each grid screenshot, a matching full-screen screenshot, and the
     # capture rect to ~/.talon/gaze_grid_debug for diagnosing click offsets.
     user.gaze_grid_debug_capture = false
+
+    # Toolbar action selected when the grid opens and after each click:
+    # zoom, left, right, double, triple, cmd (macOS), shift, ctrl or drag.
+    # "zoom" makes the click sound (or a cell dwell) narrow the grid instead.
+    user.gaze_grid_default_action = "zoom"
+
+    # Seconds to hover over a mouse action button (above the grid) to select it.
+    user.gaze_grid_action_dwell = 1.5
+
+    # Perform the selected mouse action by hovering over a grid cell, instead of
+    # (or as well as) the click sound. The cell fills up while you hover.
+    user.gaze_grid_cell_dwell_enabled = true 
+
+    # Seconds to hover over a grid cell to perform the selected mouse action.
+    user.gaze_grid_cell_dwell = 1.5
+
+    # How far (pixels) the cursor may drift during a grid cell dwell and still
+    # count as still. Moving further restarts the count from the new spot.
+    # Raise it if eye tracking jitter keeps restarting the dwell.
+    user.gaze_grid_cell_dwell_radius = 1

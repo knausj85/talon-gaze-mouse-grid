@@ -1,8 +1,17 @@
+import time
 from datetime import datetime
 from pathlib import Path
 
 from talon import Module, actions, canvas, cron, ctrl, scope, screen, settings, ui
 from talon.skia import Paint, Rect
+
+from .gaze_grid_action_toolbar import (
+    ActionToolbar,
+    DwellTimer,
+    draw_dwell_fill,
+    perform_click,
+    perform_drag,
+)
 
 
 def clamp(value, lo, hi):
@@ -83,6 +92,47 @@ mod.setting(
     default=False,
     desc="Save each grid screenshot, a matching full-screen screenshot, and the capture rect to ~/.talon/gaze_grid_debug",
 )
+
+mod.setting(
+    "gaze_grid_action_dwell",
+    type=float,
+    default=1.5,
+    desc="Seconds to hover over a mouse action button above the grid to select it",
+)
+mod.setting(
+    "gaze_grid_cell_dwell_enabled",
+    type=bool,
+    default=False,
+    desc="Perform the selected mouse action by hovering over a grid cell",
+)
+mod.setting(
+    "gaze_grid_cell_dwell",
+    type=float,
+    default=1.5,
+    desc="Seconds to hover over a grid cell to perform the selected mouse action",
+)
+
+mod.setting(
+    "gaze_grid_cell_dwell_radius",
+    type=int,
+    default=25,
+    desc="Pixels the cursor may drift and still count as still for a grid cell dwell",
+)
+
+mod.setting(
+    "gaze_grid_default_action",
+    type=str,
+    default="left",
+    desc="Toolbar action selected when the grid opens and after each click: "
+    "zoom, left, right, double, triple, cmd (macOS), shift, ctrl or drag",
+)
+
+# How often dwell selection checks the cursor.
+DWELL_TICK = "30ms"
+CELL_DWELL_FILL_COLOR = "4696ff66"
+CELL_DWELL_BORDER_COLOR = "c8e0ffff"
+DRAG_PENDING_TEXT = "Drag: pick the drop point, then click"
+DRAG_START_COLOR = "00e0ffff"
 
 DEBUG_DIR = Path.home() / ".talon" / "gaze_grid_debug"
 _debug_capture_count = 0
@@ -173,6 +223,14 @@ class GazeMouseGrid:
         self.was_zoom_mouse_active = False
         self.was_control_mouse_active = False
         self.was_control1_mouse_active = False
+        self.toolbar = ActionToolbar(lambda: settings.get("user.gaze_grid_default_action"))
+        self.cell_dwell = DwellTimer()
+        # Where the cursor came to rest; the cell dwell's target. Moving further
+        # than the dwell radius from it starts a new dwell at the new spot.
+        self._dwell_anchor = None
+        self.drag_start = None
+        self._dwell_job = None
+        self._capturing = False
 
     def setup(self):
         """Initialize canvas and set target rect to full screen."""
@@ -210,6 +268,7 @@ class GazeMouseGrid:
         self.mcanvas.register("draw", self.draw)
         self.active = True
         self.update_screenshot()
+        self.start_dwell_tracking()
 
     def auto_narrow_to_cursor(self, mx, my):
         """Narrow self.rect centered on (mx, my) by the initial narrow factor."""
@@ -221,6 +280,7 @@ class GazeMouseGrid:
             return
 
         target = self.cursor_to_target()
+        self.stop_dwell_tracking()
 
         self.mcanvas.unregister("draw", self.draw)
         self.mcanvas.close()
@@ -231,6 +291,83 @@ class GazeMouseGrid:
         self.disable_control_mouse()
         self.restore_eye_tracking_state()
         ctrl.mouse_move(*target)
+        return target
+
+    def reset_action(self):
+        """Back to the default (left click), forgetting any half-finished drag."""
+        self.drag_start = None
+        self.toolbar.reset()
+
+    def start_dwell_tracking(self):
+        self.stop_dwell_tracking()
+        self.reset_cell_dwell()
+        self._dwell_job = cron.interval(DWELL_TICK, self.update_dwell)
+
+    def stop_dwell_tracking(self):
+        self.reset_cell_dwell()
+        if self._dwell_job is not None:
+            cron.cancel(self._dwell_job)
+            self._dwell_job = None
+
+    def update_dwell(self):
+        """Advance toolbar and grid cell dwells; redraw when their look changes."""
+        if not self.active or self.mcanvas is None or self._capturing:
+            return
+        mx, my = ctrl.mouse_pos()
+        now = time.perf_counter()
+        changed = self.toolbar.update(mx, my, now, settings.get("user.gaze_grid_action_dwell"))
+
+        fired = False
+        if settings.get("user.gaze_grid_cell_dwell_enabled"):
+            before = self.cell_dwell.state()
+            fired = self.cell_dwell.update(
+                self.update_dwell_anchor(mx, my), now, settings.get("user.gaze_grid_cell_dwell")
+            )
+            changed = changed or before != self.cell_dwell.state()
+        elif self.cell_dwell.target is not None:
+            self.reset_cell_dwell()
+            changed = True
+
+        if fired:
+            # Outside this cron callback, which the click's close() cancels. Tracking
+            # keeps running in case the click is refused (cursor moved off the grid).
+            cron.after("0ms", actions.user.gaze_grid_click)
+        if changed or fired:
+            self.mcanvas.freeze()
+
+    def reset_cell_dwell(self):
+        self.cell_dwell.clear()
+        self._dwell_anchor = None
+
+    def update_dwell_anchor(self, x, y):
+        """The point the cursor is resting at, or None off the grid.
+
+        The anchor only moves when the cursor leaves the dwell radius around it, so
+        a new anchor (a new dwell target) means the cursor moved and the count restarts.
+        """
+        if self.cell_at(x, y) is None:
+            self._dwell_anchor = None
+            return None
+        radius = settings.get("user.gaze_grid_cell_dwell_radius")
+        anchor = self._dwell_anchor
+        if anchor is None or (x - anchor[0]) ** 2 + (y - anchor[1]) ** 2 > radius**2:
+            self._dwell_anchor = (x, y)
+        return self._dwell_anchor
+
+    def cell_at(self, x, y):
+        """(col, row) of the drawn grid cell at (x, y), or None off the grid."""
+        draw_rect = self.calc_draw_rect()
+        if not _rect_contains(draw_rect, x, y):
+            return None
+        grid_size = settings.get("user.gaze_grid_size")
+        col = clamp(int((x - draw_rect.x) / draw_rect.width * grid_size), 0, grid_size - 1)
+        row = clamp(int((y - draw_rect.y) / draw_rect.height * grid_size), 0, grid_size - 1)
+        return (col, row)
+
+    def is_cursor_on_toolbar(self):
+        if not self.active:
+            return False
+        return self.toolbar.contains(*ctrl.mouse_pos())
 
     def cursor_to_target(self):
         """Map the cursor's exact position on the drawn grid to the real target region."""
@@ -262,6 +399,51 @@ class GazeMouseGrid:
         self.draw_screenshot(c, draw_rect)
         self.draw_hint_highlight(c, draw_rect)
         self.draw_grid_lines(c, draw_rect)
+        self.draw_cell_dwell(c, draw_rect)
+        self.draw_drag_start(c, draw_rect)
+
+        self.toolbar.status_text = DRAG_PENDING_TEXT if self.drag_start else None
+        self.toolbar.layout(draw_rect, self.screen.rect)
+        self.toolbar.draw(c)
+
+    def draw_cell_dwell(self, c, draw_rect):
+        """Fill the cell under the cursor from the bottom up as its dwell runs."""
+        anchor = self.cell_dwell.target
+        if anchor is None:
+            return
+        cell = self.cell_at(*anchor)
+        if cell is None:
+            return
+        col, row = cell
+        grid_size = settings.get("user.gaze_grid_size")
+        cell_w = draw_rect.width / grid_size
+        cell_h = draw_rect.height / grid_size
+        cell_rect = Rect(draw_rect.x + col * cell_w, draw_rect.y + row * cell_h, cell_w, cell_h)
+
+        draw_dwell_fill(c, cell_rect, self.cell_dwell.progress, color=CELL_DWELL_FILL_COLOR)
+        paint = c.paint
+        paint.style = Paint.Style.STROKE
+        paint.stroke_width = 3
+        paint.color = CELL_DWELL_BORDER_COLOR
+        c.draw_rect(cell_rect)
+
+    def draw_drag_start(self, c, draw_rect):
+        """Mark where a pending drag starts, if it's inside the zoomed region."""
+        if self.drag_start is None:
+            return
+        sx, sy = self.drag_start
+        if not _rect_contains(self.rect, sx, sy):
+            return
+        x = draw_rect.x + (sx - self.rect.x) / self.rect.width * draw_rect.width
+        y = draw_rect.y + (sy - self.rect.y) / self.rect.height * draw_rect.height
+        paint = c.paint
+        paint.antialias = True
+        paint.color = DRAG_START_COLOR
+        paint.style = Paint.Style.STROKE
+        paint.stroke_width = 3
+        c.draw_circle(x, y, 10)
+        paint.style = Paint.Style.FILL
+        c.draw_circle(x, y, 3)
 
     def calc_draw_rect(self):
         """Compute centered draw rect scaled by the display ratio setting."""
@@ -413,21 +595,46 @@ class GazeMouseGrid:
         self.rect = Rect(new_x, new_y, w, h)
 
     def click_target(self):
-        """Close grid (moves mouse to target) and click."""
-        if not self.active:
-            return
+        """Close grid (moves mouse to target) and perform the selected mouse action.
 
-        self.close()
-        actions.mouse_click(0)
+        Returns True when the grid should reopen: the first click of a drag only
+        records where the drag starts, and the grid reopens to pick the drop point.
+        """
+        if not self.active:
+            return False
+
+        action = self.toolbar.selected
+        target = self.close()
+
+        if action.is_drag:
+            if self.drag_start is None:
+                self.drag_start = target
+                return True
+            start = self.drag_start
+            self.reset_action()
+            perform_drag(start, target)
+            return False
+
+        self.reset_action()
+        perform_click(action)
+        return False
 
     def update_screenshot(self):
         """Capture screenshot of target rect for background display."""
 
         def finish_capture():
-            self.img = screen.capture_rect(self.rect)
-            _save_debug_capture(self.img, self.rect, self.screen.rect)
-            self.mcanvas.freeze()
+            try:
+                if self.mcanvas is None:
+                    return
+                self.img = screen.capture_rect(self.rect)
+                _save_debug_capture(self.img, self.rect, self.screen.rect)
+                self.mcanvas.freeze()
+            finally:
+                self._capturing = False
 
+        # The toolbar's redraws would show the canvas again mid-capture.
+        self._capturing = True
+        self.reset_cell_dwell()
         self.mcanvas.hide()
         cron.after("16ms", finish_capture)
 
@@ -484,6 +691,7 @@ class GazeGridActions:
         """Close the gaze mouse grid"""
         _exit_grid_mode()
         gaze_grid.close()
+        gaze_grid.reset_action()
         _restore_previous_modes()
 
     def gaze_grid_toggle():
@@ -498,12 +706,28 @@ class GazeGridActions:
         gaze_grid.narrow_at_cursor()
 
     def gaze_grid_click():
-        """Click at the target location and close the grid"""
+        """Perform the toolbar's selected action at the cursor: zoom into the cell, or
+        click at the target location and close the grid"""
+        if gaze_grid.is_cursor_on_toolbar():
+            return
         if gaze_grid.is_cursor_off_grid():
             actions.app.notify("Cursor is outside the grid")
             return
 
+        if gaze_grid.toolbar.selected.is_zoom:
+            gaze_grid.narrow_at_cursor()
+            return
+
         _exit_grid_mode()
-        gaze_grid.click_target()
+        reopen = gaze_grid.click_target()
         _restore_previous_modes()
+        if reopen:
+            actions.user.gaze_grid_activate()
+
+    def gaze_grid_select_action(name: str):
+        """Select the action used by the next grid click: zoom, left, right, double,
+        triple, cmd (macOS only), shift, ctrl or drag"""
+        gaze_grid.toolbar.select(name)
+        if gaze_grid.active and gaze_grid.mcanvas is not None:
+            gaze_grid.mcanvas.freeze()
 
