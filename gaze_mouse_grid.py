@@ -1,3 +1,4 @@
+import sys
 import time
 from datetime import datetime
 from pathlib import Path
@@ -133,6 +134,10 @@ CELL_DWELL_FILL_COLOR = "4696ff66"
 CELL_DWELL_BORDER_COLOR = "c8e0ffff"
 DRAG_PENDING_TEXT = "Drag: pick the drop point, then click"
 DRAG_START_COLOR = "00e0ffff"
+# The marker left at a pending drag's start while the grid is closed.
+DRAG_INDICATOR_RADIUS = 7
+DRAG_INDICATOR_COLOR = "00e0ffcc"
+DRAG_INDICATOR_OUTLINE = "000000aa"
 
 DEBUG_DIR = Path.home() / ".talon" / "gaze_grid_debug"
 _debug_capture_count = 0
@@ -220,6 +225,9 @@ class GazeMouseGrid:
         self.active = False
         self._draw_rect_cache = None
         self._hint_pos = None
+        # After a zoom: the real-screen area of the cell zoomed into. Drawn instead
+        # of _hint_pos's cell, since that cell spans several cells of the new grid.
+        self._hint_rect = None
         self.was_zoom_mouse_active = False
         self.was_control_mouse_active = False
         self.was_control1_mouse_active = False
@@ -229,6 +237,8 @@ class GazeMouseGrid:
         # than the dwell radius from it starts a new dwell at the new spot.
         self._dwell_anchor = None
         self.drag_start = None
+        self._drag_indicator = None
+        self._opening = False
         self._dwell_job = None
         self._capturing = False
 
@@ -253,6 +263,8 @@ class GazeMouseGrid:
         if self.active:
             return
 
+        self._opening = True
+        self.sync_drag_indicator()
         self.save_eye_tracking_state()
         actions.tracking.control1_toggle(True)
         cron.after(settings.get("user.gaze_grid_settle_delay"), self.show_after_gaze_settle)
@@ -262,11 +274,13 @@ class GazeMouseGrid:
         gaze_x, gaze_y = ctrl.mouse_pos()
         self.auto_narrow_to_cursor(gaze_x, gaze_y)
         self._hint_pos = (gaze_x, gaze_y)
+        self._hint_rect = None
         actions.tracking.control1_toggle(False)
         self.enable_control_mouse()
 
         self.mcanvas.register("draw", self.draw)
         self.active = True
+        self._opening = False
         self.update_screenshot()
         self.start_dwell_tracking()
 
@@ -294,9 +308,40 @@ class GazeMouseGrid:
         return target
 
     def reset_action(self):
-        """Back to the default (left click), forgetting any half-finished drag."""
-        self.drag_start = None
+        """Back to the default action, cancelling any pending drag."""
+        self.set_drag_start(None)
         self.toolbar.reset()
+
+    def set_drag_start(self, pos):
+        """Cache where a drag starts (None: no drag pending)."""
+        self.drag_start = pos
+        self.toolbar.drag_pending = pos is not None
+        self.sync_drag_indicator()
+
+    def sync_drag_indicator(self):
+        """Show the pending-drag marker at the drag's start while the grid is closed."""
+        want = self.drag_start is not None and not self.active and not self._opening
+        if want and self._drag_indicator is None:
+            x, y = self.drag_start
+            size = DRAG_INDICATOR_RADIUS * 2 + 6
+            self._drag_indicator = canvas.Canvas.from_rect(Rect(x - size / 2, y - size / 2, size, size))
+            self._drag_indicator.register("draw", self.draw_drag_indicator)
+            self._drag_indicator.freeze()
+        elif not want and self._drag_indicator is not None:
+            self._drag_indicator.close()
+            self._drag_indicator = None
+
+    def draw_drag_indicator(self, c):
+        cx, cy = c.rect.x + c.rect.width / 2, c.rect.y + c.rect.height / 2
+        paint = c.paint
+        paint.antialias = True
+        paint.style = Paint.Style.STROKE
+        paint.stroke_width = 4
+        paint.color = DRAG_INDICATOR_OUTLINE
+        c.draw_circle(cx, cy, DRAG_INDICATOR_RADIUS)
+        paint.stroke_width = 2
+        paint.color = DRAG_INDICATOR_COLOR
+        c.draw_circle(cx, cy, DRAG_INDICATOR_RADIUS)
 
     def start_dwell_tracking(self):
         self.stop_dwell_tracking()
@@ -478,7 +523,11 @@ class GazeMouseGrid:
         c.draw_image_rect(self.img, src, draw_rect)
 
     def draw_hint_highlight(self, c, draw_rect):
-        """Draw a faint highlight on the grid cell closest to the last cursor position."""
+        """Highlight the area last zoomed into, or else the grid cell holding the
+        gaze position the grid opened at."""
+        if self._hint_rect is not None:
+            self.draw_hint_rect(c, draw_rect)
+            return
         if self._hint_pos is None:
             return
 
@@ -520,6 +569,28 @@ class GazeMouseGrid:
             c.draw_line(x + i * w / grid_size, y, x + i * w / grid_size, y + h)
             c.draw_line(x, y + i * h / grid_size, x + w, y + i * h / grid_size)
 
+    def draw_hint_rect(self, c, draw_rect):
+        """Fill the drawn area showing _hint_rect (real-screen coordinates)."""
+        hint = self._hint_rect
+        scale_x = draw_rect.width / self.rect.width
+        scale_y = draw_rect.height / self.rect.height
+        left = max(hint.x, self.rect.x)
+        top = max(hint.y, self.rect.y)
+        right = min(hint.x + hint.width, self.rect.x + self.rect.width)
+        bottom = min(hint.y + hint.height, self.rect.y + self.rect.height)
+        if right <= left or bottom <= top:
+            return
+
+        paint = c.paint
+        paint.color = settings.get("user.gaze_grid_hint_color")
+        paint.style = Paint.Style.FILL
+        c.draw_rect(Rect(
+            draw_rect.x + (left - self.rect.x) * scale_x,
+            draw_rect.y + (top - self.rect.y) * scale_y,
+            (right - left) * scale_x,
+            (bottom - top) * scale_y,
+        ))
+
     def narrow_at_cursor(self):
         """Narrow to the selected cell plus surrounding padding cells."""
         if not self.active:
@@ -541,6 +612,9 @@ class GazeMouseGrid:
 
         new_w = (1 + 2 * padding) * cell_w
         new_h = (1 + 2 * padding) * cell_h
+
+        # The cell being zoomed into, to highlight in the new view.
+        self._hint_rect = Rect(self.rect.x + col * cell_w, self.rect.y + row * cell_h, cell_w, cell_h)
 
         if new_w < 1 or new_h < 1:
             target_x = self.rect.x + (col + 0.5) * cell_w
@@ -597,27 +671,27 @@ class GazeMouseGrid:
     def click_target(self):
         """Close grid (moves mouse to target) and perform the selected mouse action.
 
-        Returns True when the grid should reopen: the first click of a drag only
-        records where the drag starts, and the grid reopens to pick the drop point.
+        A drag takes two: the first caches the start (the grid closes, leaving a
+        marker there); the next, after the user reopens the grid, drops.
         """
         if not self.active:
-            return False
+            return
 
         action = self.toolbar.selected
         target = self.close()
 
         if action.is_drag:
             if self.drag_start is None:
-                self.drag_start = target
-                return True
+                self.toolbar.reset()
+                self.set_drag_start(target)
+                return
             start = self.drag_start
             self.reset_action()
             perform_drag(start, target)
-            return False
+            return
 
         self.reset_action()
         perform_click(action)
-        return False
 
     def update_screenshot(self):
         """Capture screenshot of target rect for background display."""
@@ -673,7 +747,28 @@ class GazeMouseGrid:
         self.was_control1_mouse_active = False
 
 
+    def shutdown(self):
+        """Release canvases and timers (a newer load of this module replaces us)."""
+        self.stop_dwell_tracking()
+        self.drag_start = None
+        self.active = False
+        self._opening = False
+        self.sync_drag_indicator()
+        if self.mcanvas is not None:
+            self.mcanvas.close()
+            self.mcanvas = None
+
+
+# Talon reloads this module on edit; the previous instance's canvases would linger.
+_previous_grid = getattr(sys, "_gaze_mouse_grid_instance", None)
+if _previous_grid is not None:
+    try:
+        _previous_grid.shutdown()
+    except Exception as e:
+        print(f"gaze_mouse_grid: shutting down the previous instance failed: {e!r}")
+
 gaze_grid = GazeMouseGrid()
+sys._gaze_mouse_grid_instance = gaze_grid
 
 
 @mod.action_class
@@ -719,10 +814,8 @@ class GazeGridActions:
             return
 
         _exit_grid_mode()
-        reopen = gaze_grid.click_target()
+        gaze_grid.click_target()
         _restore_previous_modes()
-        if reopen:
-            actions.user.gaze_grid_activate()
 
     def gaze_grid_select_action(name: str):
         """Select the action used by the next grid click: zoom, left, right, double,

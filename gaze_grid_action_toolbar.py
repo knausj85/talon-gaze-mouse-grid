@@ -78,6 +78,8 @@ MOUSE_ACTIONS: list[MouseAction] = [
     MouseAction("drag", "Drag", is_drag=True),
 ]
 ACTIONS_BY_KEY = {a.key: a for a in MOUSE_ACTIONS}
+# While a drag waits for its drop point, the only choices: zoom to aim, or drop.
+DRAG_PENDING_ACTION_KEYS = ("zoom", "drag")
 DEFAULT_ACTION_KEY = "left"
 
 
@@ -185,6 +187,8 @@ class ActionToolbar:
         self._default_key = default_key
         # None: the default action.
         self.selected_key: Optional[str] = None
+        # A drag's start is picked: only zoom and drag are offered, drag by default.
+        self.drag_pending = False
         self.status_text: Optional[str] = None
         self._buttons: list[tuple[MouseAction, Rect]] = []
         self._panel: Optional[Rect] = None
@@ -192,15 +196,24 @@ class ActionToolbar:
         self._hovered: Optional[str] = None
         self._dwell = DwellTimer()
 
+    def available_actions(self) -> list[MouseAction]:
+        if self.drag_pending:
+            return [ACTIONS_BY_KEY[k] for k in DRAG_PENDING_ACTION_KEYS]
+        return MOUSE_ACTIONS
+
     @property
     def selected(self) -> MouseAction:
-        if self.selected_key in ACTIONS_BY_KEY:
-            return ACTIONS_BY_KEY[self.selected_key]
+        available = {a.key: a for a in self.available_actions()}
+        if self.selected_key in available:
+            return available[self.selected_key]
+        if self.drag_pending:
+            return available["drag"]
         return ACTIONS_BY_KEY.get(self._default_key(), ACTIONS_BY_KEY[DEFAULT_ACTION_KEY])
 
     def select(self, key: str):
-        if key not in ACTIONS_BY_KEY:
-            raise ValueError(f"unknown mouse action {key!r}; one of {sorted(ACTIONS_BY_KEY)}")
+        available = [a.key for a in self.available_actions()]
+        if key not in available:
+            raise ValueError(f"mouse action {key!r} isn't available now; one of {available}")
         self.selected_key = key
         self._clear_hover()
 
@@ -223,7 +236,8 @@ class ActionToolbar:
     def layout(self, draw_rect: Rect, screen_rect: Rect):
         """Place the toolbar centered above the zoom view; below it if there's no room
         above; over the top of the screen if there's room for neither."""
-        n = len(MOUSE_ACTIONS)
+        shown = self.available_actions()
+        n = len(shown)
         natural_w = n * BUTTON_W + (n - 1) * BUTTON_GAP + 2 * PANEL_PAD
         natural_h = BUTTON_H + 2 * PANEL_PAD
         self._scale = min(1.0, (screen_rect.width - 2 * PANEL_GAP) / natural_w)
@@ -247,7 +261,7 @@ class ActionToolbar:
         self._buttons = []
         bx = x + PANEL_PAD * s
         by = y + PANEL_PAD * s
-        for action in MOUSE_ACTIONS:
+        for action in shown:
             self._buttons.append((action, Rect(bx, by, BUTTON_W * s, BUTTON_H * s)))
             bx += (BUTTON_W + BUTTON_GAP) * s
 
